@@ -1,0 +1,879 @@
+---
+title: "DSI"
+author: "whr"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# 1.load package
+
+```{r}
+library(haven) # read .dta file
+library(dplyr)
+library(ggplot2)
+library(stringr)
+library(patchwork)
+library(broom)
+```
+# 2.read data
+
+```{r}
+data_mtlv <- read_dta("data/mat_leave_country_year.dta")
+data_other_vars <- read.csv('data/final_dataset1.csv')
+```
+
+
+## 2.1. tidy country name
+
+```{r}
+country_mapping <- data.frame(
+  code = c("AM", "BD", "BF", "BJ", "CG", "CM", "CO", "DR", "ET", "GA", "GH", "GN", "HT", "JO", "KE", "KH", "LS", "MD", "ML", "MZ", "NG", "NI", "NM", "NP", "PE", "RW", "SN", "TZ", "UG", "ZM", "ZW"),
+  full_name = c("Armenia", "Bangladesh", "Burkina Faso", "Benin", "Congo", "Cameroon", "Colombia", "Dominican Republic", 
+                "Ethiopia", "Gabon", "Ghana", "Guinea", "Haiti", "Jordan", "Kenya", "Cambodia", "Lesotho", "Moldova", 
+                "Mali", "Mozambique", "Nigeria", "Nicaragua", "Namibia", "Nepal", "Peru", "Rwanda", "Senegal", 
+                "Tanzania", "Uganda", "Zambia", "Zimbabwe")
+)
+
+data_other_vars <- data_other_vars %>%
+  left_join(country_mapping, by = c("country" = "code")) %>%
+  mutate(country = full_name) %>% 
+  select(-full_name)
+```
+
+
+## 2.2.common country
+
+```{r}
+common_countries <- intersect(unique(data_other_vars$country), unique(data_mtlv$country))
+common_countries
+```
+
+
+
+## 2.3.treated country
+
+
+```{r}
+treated_data <- data_other_vars[data_other_vars$status == "Treated", ]
+treated_countries <- unique(treated_data$country)
+print(treated_countries)
+```
+
+
+## 2.4.missing country
+```{r}
+missing_country1 <- setdiff(unique(data_other_vars$country), unique(data_mtlv$country))
+missing_country2 <- setdiff(unique(data_mtlv$country), unique(data_other_vars$country))
+
+print(missing_country1)
+print(missing_country2)
+```
+
+## 2.5.data only common country
+
+```{r}
+data_other_vars_common <- data_other_vars %>%
+  filter(country %in% common_countries)
+
+data_mtlv_common <- data_mtlv %>%
+  filter(country %in% common_countries)
+```
+
+
+# 3.mtlv
+
+## 3.1.mtlv mean by country
+
+```{r}
+data_mtlv_mean <- data_mtlv %>%
+  group_by(country) %>%
+  summarise(across(where(is.numeric), \(x) mean(x, na.rm = TRUE)))
+```
+
+## 3.2.mtlv mean only common country
+
+```{r}
+data_mtlv_mean_common <- data_mtlv_mean %>%
+  filter(country %in% common_countries)
+```
+
+## 3.3.plot mtlv mean
+
+```{r}
+data_mtlv_long <- data_mtlv_mean_common %>%
+  tidyr::pivot_longer(
+    cols = starts_with("mtlv_pdr_"),  # Select the column whose name begins with “mtlv_pdr_”
+    names_to = "year",                # New column: Year column
+    values_to = "value"               # New column: column for indicator values
+  ) %>%
+  mutate(
+    year = as.numeric(sub("mtlv_pdr_", "", year))  # Extract year numbers and convert to numeric types
+  )
+```
+
+
+```{r}
+ggplot(data_mtlv_long, aes(x = year, y = value, color = country, group = country)) +
+  geom_line() +       # Adding Curves
+  geom_point() +      # Adding Data Points
+  labs(
+    title = "Country-wise Changes Over Years",
+    x = "Year",
+    y = "Value",
+    color = "Country"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "right",         # Setting the legend position
+    axis.text.x = element_text(angle = 45, hjust = 1)  # Rotating year labels
+  )
+```
+
+
+
+# 4.other variable data
+
+## 4.1.variable selection
+
+```{r}
+analysis_variable <- data_other_vars_common %>% 
+  select(hforage_mean, # HAZ, cts var
+         stunted_mean, # Degree of stunting
+         weight_mean,  # cluster weight mean
+         rural_mean,   # if rural (0 or 1)
+         mat_lit_mean, # clusterMaternal literacy rate
+         mat_height_mean, # cluster Average height of mothers
+         matwork_mean, # clusterProportion of working mothers
+         country,
+         status,
+         survey_year
+         )
+```
+
+
+## 4.2.mean by country
+
+```{r}
+analysis_variable_mean <- analysis_variable %>%
+  group_by(country) %>%
+  summarise(across(where(is.numeric), \(x) mean(x, na.rm = TRUE)))
+```
+
+
+## 4.3.into blocks
+
+```{r}
+split_into_blocks <- function(df, block_size = 500) {
+  df <- df %>%
+    mutate(block = ceiling(row_number() / block_size))
+  return(df)
+}
+
+# Grouping and slicing by country block
+data_with_blocks <- analysis_variable %>%
+  group_by(country,
+           survey_year) %>%
+  group_modify(~ split_into_blocks(.x, block_size = 500)) %>%
+  ungroup()
+```
+
+## 4.4.mean by block
+
+```{r}
+block_means <- data_with_blocks %>%
+  group_by(country, 
+           survey_year,
+           block) %>%
+  summarise(across(where(is.numeric), mean, na.rm = TRUE)) %>%
+  ungroup()
+```
+
+
+# 5.modeling
+
+## 5.1.PCA
+
+
+
+```{r}
+# Remove rows containing NA
+block_means_clean <- block_means %>%
+  na.omit()
+
+# Remove non-numeric columns and keep only the numeric part for dimensionality reduction
+block_means_numeric <- block_means_clean %>%
+  select(-country, -block)
+```
+
+
+```{r}
+pca_result <- prcomp(block_means_numeric, scale. = TRUE)
+
+# Extracting the first two principal components
+pca_2d <- as.data.frame(pca_result$x[, 1:2])
+colnames(pca_2d) <- c("PC1", "PC2")  # 重命名列
+
+# Combining downscaling results with original country and block information
+pca_2d <- cbind(block_means_clean[, c("country","survey_year", "block")], pca_2d)
+```
+
+
+## 5.2.scree plot
+
+```{r}
+explained_variance <- pca_result$sdev^2 / sum(pca_result$sdev^2)
+
+```
+
+
+```{r}
+scree_data <- data.frame(
+  Principal_Component = seq_along(explained_variance),
+  Explained_Variance = explained_variance
+)
+```
+
+
+```{r}
+ggplot(scree_data, aes(x = Principal_Component, y = Explained_Variance)) +
+  geom_bar(stat = "identity", fill = "steelblue", alpha = 0.7) +
+  geom_line(color = "red", linewidth = 1) +
+  geom_point(color = "red", size = 2) +
+  labs(title = "Scree Plot",
+       x = "Principal Component",
+       y = "Proportion of Variance Explained") +
+  theme_minimal()
+```
+
+
+## 5.3.scatter plot by country
+
+```{r}
+ggplot(pca_2d, aes(x = PC1, y = PC2, color = country)) +
+  geom_point(size = 3, alpha = 0.8) +  # Scatter size and transparency
+  labs(title = "PCA: Block-Level Averages (2D Projection)",
+       x = "Principal Component 1",
+       y = "Principal Component 2") +
+  theme_minimal() +  # 
+  theme(legend.title = element_text(size = 12),  # Legend title font
+        legend.text = element_text(size = 10)) 
+```
+
+## 5.4.scatter plot by status
+
+```{r}
+status_info <- data_with_blocks %>%
+  select(country, block, status) %>%
+  distinct()
+
+# Merge status information into PCA data
+pca_2d_with_status <- pca_2d %>%
+  left_join(status_info, by = c("country", "block"))
+
+```
+
+
+```{r}
+ggplot(pca_2d_with_status, aes(x = PC1, y = PC2, color = status)) +
+  geom_point(size = 3, alpha = 0.8) +
+  labs(title = "PCA: Block-Level Averages",
+       x = "Principal Component 1",
+       y = "Principal Component 2",
+       color = "Group") +
+  theme_minimal()
+```
+
+
+
+```{r}
+country_year_count <- data_other_vars_common %>%
+  group_by(country) %>%
+  summarise(num_survey_years = n_distinct(survey_year)) %>%
+  arrange(desc(num_survey_years))  # Sort by number in descending order
+
+
+print(country_year_count)
+
+country_years <- data_other_vars_common %>%
+  group_by(country) %>%
+  summarise(survey_years = paste(sort(unique(survey_year)), collapse = ", ")) %>%
+  arrange(country)
+
+
+print(country_years)
+```
+
+
+```{r}
+common_countries
+treated_countries
+```
+
+## 5.5. 4 groups
+```{r}
+pca_2d_4groups <- pca_2d_with_status %>%
+  mutate(group = case_when(
+    status == "Control" & survey_year < 2004 ~ "Control: Before 2004",
+    status == "Control" & survey_year >= 2004 ~ "Control: After 2004",
+    status == "Treated" & survey_year < 2004 ~ "Treated: Before 2004",
+    status == "Treated" & survey_year >= 2004 ~ "Treated: After 2004"
+  ))
+
+```
+
+
+```{r}
+
+group_colors <- c(
+  "Control: Before 2004" = "salmon",
+  "Control: After 2004" = "red",
+  "Treated: Before 2004" = "#a2d2ff",
+  "Treated: After 2004" = "blue"
+)
+
+ggplot(pca_2d_4groups, aes(x = PC1, y = PC2, color = group)) +
+  geom_point(size = 2, alpha = 0.8) +
+  scale_color_manual(values = group_colors) + 
+  labs(title = "Cluster 4: maternity leave removed",
+       x = "Principal Component 1",
+       y = "Principal Component 2",
+       color = "Group") +  # Legend title
+  theme_minimal() +
+  theme(
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10)
+  )
+```
+```{r}
+p <- ggplot(pca_2d_4groups, aes(x = PC1, y = PC2, color = group)) +
+  geom_point(size = 2, alpha = 0.8) +
+  scale_color_manual(values = group_colors) +
+  labs(title = "Cluster 4: maternity leave removed",
+       x = "Principal Component 1",
+       y = "Principal Component 2",
+       color = "Group") +
+  theme_minimal() +
+  theme(
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10)
+  )
+
+ggsave(
+  filename = "DSI Cluster 4.png",
+  plot = p,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+```
+
+
+
+
+# 6.merge data
+
+## 6.1. merge
+
+```{r}
+colnames(data_mtlv_mean_common) <- str_remove(colnames(data_mtlv_mean_common), "mtlv_pdr_")
+```
+
+```{r}
+data_mtlv_long <- data_mtlv_mean_common %>%
+  tidyr::pivot_longer(
+    cols = -country,  # Convert all columns except the “country” column to long form
+    names_to = "year",  # New column name “year”
+    values_to = "maternity_leave"  # New listing for length of maternity leave
+  ) %>%
+  mutate(year = as.numeric(year))
+```
+
+
+```{r}
+merged_data <- data_other_vars_common %>%
+  left_join(
+    data_mtlv_long,
+    by = c("country" = "country", "survey_year" = "year")
+  )
+```
+
+
+## 6.2. select
+
+### 6.2.1.all variable
+```{r}
+merged_data_selected <- merged_data %>% 
+  select(hforage_mean, # HAZ, cts var
+         stunted_mean,
+         weight_mean,  
+         rural_mean,  
+         mat_lit_mean, 
+         mat_height_mean, 
+         matwork_mean,
+         country,
+         status,
+         survey_year,
+         maternity_leave
+         )
+```
+
+
+
+
+
+### 6.2.2.into block
+
+```{r}
+split_into_blocks <- function(df, block_size = 500) {
+  df <- df %>%
+    mutate(block = ceiling(row_number() / block_size))
+  return(df)
+}
+
+# Grouping and slicing by country block
+merged_selected_blocks <- merged_data_selected %>%
+  group_by(country,
+           survey_year) %>%
+  group_modify(~ split_into_blocks(.x, block_size = 500)) %>%
+  ungroup() %>% 
+  group_by(country, 
+           survey_year,
+           block) %>%
+  summarise(across(where(is.numeric), mean, na.rm = TRUE)) %>%
+  ungroup()
+```
+
+```{r}
+# define matching library
+status_vector <- setNames(merged_data_selected$status, merged_data_selected$country)
+
+# use match() to add `status` column to merged_selected_blocks
+merged_selected_blocks$status <- status_vector[merged_selected_blocks$country]
+```
+
+
+### 6.2.3.clean NA
+
+```{r}
+merged_selected_blocks <- merged_selected_blocks %>%
+  na.omit()
+```
+
+
+### 6.2.4. 4groups
+
+```{r}
+merged_selected_blocks <- merged_selected_blocks %>%
+  mutate(group = case_when(
+    status == "Control" & survey_year < 2004 ~ "Control: Before 2004",
+    status == "Control" & survey_year >= 2004 ~ "Control: After 2004",
+    status == "Treated" & survey_year < 2004 ~ "Treated: Before 2004",
+    status == "Treated" & survey_year >= 2004 ~ "Treated: After 2004"
+  ))
+
+```
+
+
+
+# 7. DID
+
+
+## 7.1.did term
+```{r}
+merged_selected_blocks_did <- merged_selected_blocks %>%
+  mutate(
+    Post = ifelse(survey_year >= 2004, 1, 0),  # 1 for 2004 and onwards, 0 before that
+    Treatment = ifelse(status == "Treated", 1, 0),  # 1 for the Treated group and 0 for the Control group.
+    DID = Post * Treatment  # 交互项
+  )
+```
+
+## 7.2.dependent variable
+
+```{r}
+merged_dep_var <- merged_selected_blocks_did %>% 
+  select(hforage_mean,
+         stunted_mean, 
+         weight_mean  
+         )
+```
+
+
+### 7.2.1.PCA
+
+```{r}
+pca_result <- prcomp(merged_dep_var, scale. = TRUE)
+
+# Extracting the first two principal components
+pca_dep_var <- as.data.frame(pca_result$x[, 1])
+colnames(pca_dep_var) <- c("PC1")  # rename columns
+
+# Combining results with original country and block information
+#pca_2d <- cbind(merged_selected_blocks_did[, c("country","survey_year", "status")], pca_dep_var)
+```
+
+### 7.2.2.scree plot
+
+
+```{r}
+explained_variance <- pca_result$sdev^2 / sum(pca_result$sdev^2)
+
+```
+
+
+```{r}
+scree_data <- data.frame(
+  Principal_Component = seq_along(explained_variance),
+  Explained_Variance = explained_variance
+)
+```
+
+
+```{r}
+ggplot(scree_data, aes(x = Principal_Component, y = Explained_Variance)) +
+  geom_bar(stat = "identity", fill = "steelblue", alpha = 0.7) +
+  geom_line(color = "red", linewidth = 1) +
+  geom_point(color = "red", size = 2) +
+  labs(title = "Scree Plot",
+       x = "Principal Component",
+       y = "Proportion of Variance Explained") +
+  theme_minimal()
+```
+
+## 7.2.independent variable
+
+```{r}
+merged_indep_var <- merged_selected_blocks_did %>% 
+  select(rural_mean,  
+         mat_lit_mean,
+         mat_height_mean, 
+         matwork_mean, 
+         maternity_leave,
+         Post,
+         Treatment,
+         DID
+         )
+```
+
+
+## 7.3. merge data
+
+```{r}
+de_inde_pca <- cbind(pca_dep_var, merged_indep_var)
+```
+
+## 7.4.DID model
+
+### 7.4.1.M1: simple
+
+```{r}
+did_model_1 <- lm(PC1 ~ Post * Treatment, data = de_inde_pca)
+
+summary(did_model_1)
+```
+
+### 7.4.2.M2: add mother factor
+
+```{r}
+did_model_2 <- lm(PC1 ~ Post * Treatment + mat_lit_mean + mat_height_mean + matwork_mean, data = de_inde_pca)
+
+summary(did_model_2)
+```
+
+### 7.4.3.M3: add mother factor and rural
+
+
+```{r}
+did_model_3 <- lm(PC1 ~ Post * Treatment + mat_lit_mean + mat_height_mean +matwork_mean + rural_mean, data = de_inde_pca)
+
+summary(did_model_3)
+```
+
+
+### 7.4.4.Table
+
+
+```{r}
+extract_model_info <- function(model, model_name) {
+  # Extraction coefficients and confidence intervals
+  coef_info <- tidy(model, conf.int = TRUE) %>%
+    filter(term == "Post:Treatment") %>%
+    select(estimate, p.value, conf.low, conf.high)
+  
+  # Extract R^2
+  r_squared <- summary(model)$r.squared
+  
+  # Return results
+  tibble(
+    Model = model_name,
+    Estimate = coef_info$estimate,
+    `P-value` = coef_info$p.value,
+    `95% CI` = paste0("(", round(coef_info$conf.low, 3), ", ", round(coef_info$conf.high, 3), ")"),
+    `R^2` = r_squared
+  )
+}
+
+```
+
+
+```{r}
+# Extracting information for each model
+model1_info <- extract_model_info(did_model_1, "Model 1")
+model2_info <- extract_model_info(did_model_2, "Model 2")
+model3_info <- extract_model_info(did_model_3, "Model 3")
+
+# Merge results into a table
+result_table <- bind_rows(model1_info, model2_info, model3_info)
+
+print(result_table)
+```
+
+```{r}
+plot <- ggplot(result_table, aes(x = Model, y = Estimate)) +
+  geom_point(size = 3) +  # Plotting points indicates the value of the coefficient
+  geom_errorbar(aes(ymin = as.numeric(sub("\\(", "", gsub(",.*", "", `95% CI`))), 
+                    ymax = as.numeric(sub(".*,", "", gsub("\\)", "", `95% CI`)))), 
+                width = 0.2) +  # confidence interval 
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +  # zero base line 
+  geom_text(aes(label = round(Estimate, 3)), vjust = -1, size = 4, color = "black") +  # Labeling coefficient values
+  labs(
+    title = "Effect of Post × Treatment Across Models",
+    x = "Model",
+    y = "Estimate (Post × Treatment)"
+  ) +
+  theme_minimal()
+
+plot <- plot +
+  geom_text(aes(label = paste0("p = ", round(`P-value`, 3), "\nR² = ", round(`R^2`, 3))), 
+            vjust = -1, size = 4, color = "blue")
+print(plot)
+
+
+ggsave("DID_model_results.png", plot = plot, width = 8, height = 5)
+
+```
+
+
+
+# 8. cluster
+
+## 8.1.dependent variables
+
+```{r}
+pca_result <- prcomp(merged_dep_var, scale. = TRUE)
+
+pca_dep_var <- as.data.frame(pca_result$x[, 1:2])
+colnames(pca_dep_var) <- c("PC1","PC2")  
+
+de_var_cluster <- cbind(merged_selected_blocks_did[, c("country","survey_year", "status","group")], pca_dep_var)
+```
+
+
+```{r}
+group_colors <- c(
+  "Control: Before 2004" = "salmon",
+  "Control: After 2004" = "red",
+  "Treated: Before 2004" = "#a2d2ff",
+  "Treated: After 2004" = "blue"
+)
+
+ggplot(de_var_cluster, aes(x = PC1, y = PC2, color = group)) +
+  geom_point(size = 2, alpha = 0.8) +
+  scale_color_manual(values = group_colors) + 
+  labs(title = "PCA Scatter Plot: Grouped by Survey Year and Status",
+       x = "Principal Component 1",
+       y = "Principal Component 2",
+       color = "Group") +  
+  theme_minimal() +
+  theme(
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10)
+  )
+```
+
+
+```{r}
+p <- ggplot(de_var_cluster, aes(x = PC1, y = PC2, color = group)) +
+  geom_point(size = 2, alpha = 0.8) +
+  scale_color_manual(values = group_colors) + 
+  labs(title = "Cluster 1: dependent variables",
+       x = "Principal Component 1",
+       y = "Principal Component 2",
+       color = "Group") +  
+  theme_minimal() +
+  theme(
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10)
+  )
+
+
+ggsave(
+  filename = "DSI Cluster 1.png",
+  plot = p,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+```
+
+
+
+## 8.2.independent variables
+
+```{r}
+inde_var_cluster <- merged_selected_blocks_did %>% 
+  select(rural_mean,   
+         mat_lit_mean, 
+         mat_height_mean, 
+         matwork_mean
+         )
+```
+
+
+```{r}
+pca_result <- prcomp(inde_var_cluster, scale. = TRUE)
+
+pca_indep_var <- as.data.frame(pca_result$x[, 1:2])
+colnames(pca_indep_var) <- c("PC1","PC2")  
+
+inde_var_cluster <- cbind(merged_selected_blocks_did[, c("country","survey_year", "status","group")], pca_indep_var)
+```
+
+```{r}
+group_colors <- c(
+  "Control: Before 2004" = "salmon",
+  "Control: After 2004" = "red",
+  "Treated: Before 2004" = "#a2d2ff",
+  "Treated: After 2004" = "blue"
+)
+
+ggplot(inde_var_cluster, aes(x = PC1, y = PC2, color = group)) +
+  geom_point(size = 2, alpha = 0.8) +
+  scale_color_manual(values = group_colors) +  # Using custom colors
+  labs(title = "PCA Scatter Plot: Grouped by Survey Year and Status",
+       x = "Principal Component 1",
+       y = "Principal Component 2",
+       color = "Group") +  # Legend title
+  theme_minimal() +
+  theme(
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10)
+  )
+```
+
+```{r}
+p <- 
+ggplot(inde_var_cluster, aes(x = PC1, y = PC2, color = group)) +
+  geom_point(size = 2, alpha = 0.8) +
+  scale_color_manual(values = group_colors) +  # Using custom colors
+  labs(title = "Cluster 2: independent variables",
+       x = "Principal Component 1",
+       y = "Principal Component 2",
+       color = "Group") +  # Legend title
+  theme_minimal() +
+  theme(
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10)
+  )
+
+ggsave(
+  filename = "DSI Cluster 2.png",
+  plot = p,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+```
+
+
+
+
+## 8.3.all variable
+
+```{r}
+all_var_cluster <- merged_selected_blocks_did %>% 
+  select(hforage_mean, 
+         stunted_mean,
+         weight_mean,  
+         rural_mean,  
+         mat_lit_mean, 
+         mat_height_mean, 
+         matwork_mean 
+         )
+```
+
+
+```{r}
+pca_result <- prcomp(all_var_cluster, scale. = TRUE)
+
+pca_indep_var <- as.data.frame(pca_result$x[, 1:2])
+colnames(pca_indep_var) <- c("PC1","PC2")  
+
+inde_var_cluster <- cbind(merged_selected_blocks_did[, c("country","survey_year", "status","group")], pca_indep_var)
+```
+
+```{r}
+group_colors <- c(
+  "Control: Before 2004" = "salmon",
+  "Control: After 2004" = "red",
+  "Treated: Before 2004" = "#a2d2ff",
+  "Treated: After 2004" = "blue"
+)
+
+ggplot(inde_var_cluster, aes(x = PC1, y = PC2, color = group)) +
+  geom_point(size = 2, alpha = 0.8) +
+  scale_color_manual(values = group_colors) +  
+  labs(title = "PCA Scatter Plot: Grouped by Survey Year and Status",
+       x = "Principal Component 1",
+       y = "Principal Component 2",
+       color = "Group") +
+  theme_minimal() +
+  theme(
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10)
+  )
+```
+
+```{r}
+p <- ggplot(inde_var_cluster, aes(x = PC1, y = PC2, color = group)) +
+  geom_point(size = 2, alpha = 0.8) +
+  scale_color_manual(values = group_colors) + 
+  labs(title = "Cluster 3: all variables",
+       x = "Principal Component 1",
+       y = "Principal Component 2",
+       color = "Group") +
+  theme_minimal() +
+  theme(
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10)
+  )
+
+ggsave(
+  filename = "DSI Cluster 3.png",
+  plot = p,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
